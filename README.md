@@ -58,14 +58,16 @@ Install the email watcher via the same package — no systemd needed, works on a
 ```bash
 # Copy and edit the SMTP config
 crosstalk-watch --init
+
 # Edit ~/.crosstalk/watcher/smtp.conf with your SMTP settings
 
-# Run in foreground (test it)
+# Test email delivery
+crosstalk-watch --test
+
+# Start background daemon
 crosstalk-watch
 
-# Or fork to background
-crosstalk-watch --daemon
-# Stop later with:  crosstalk-watch --daemon --stop
+# Stop later with:  crosstalk-watch --stop
 ```
 
 ### Skills / commands
@@ -93,7 +95,7 @@ These are documentation for your agent — adapt to your host's skill/command fo
 commands/crosstalk-join.md        /crosstalk-join command (Claude Code)
 mcp/                              crosstalk MCP server + email watcher (npm package)
   dist/server.js                  built MCP server bundle
-  bin/crosstalk-watch.js          email watcher CLI (foreground, daemon, stop)
+  bin/crosstalk-watch.js          email watcher CLI (daemon, stop, status, test)
   src/                            source files (server.js + watch.js)
   BUILD.md                        build instructions
   smtp.conf.template              SMTP config template (ships with npm package)

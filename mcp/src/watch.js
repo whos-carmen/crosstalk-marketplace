@@ -4,9 +4,9 @@
 // Designed as a cross-platform replacement for the original bash + systemd notify.sh.
 //
 // Usage (via bin/crosstalk-watch.js):
-//   crosstalk-watch                    # run in foreground
-//   crosstalk-watch --daemon           # fork to background
-//   crosstalk-watch --daemon --stop    # stop background daemon
+//   crosstalk-watch                    # start background daemon
+//   crosstalk-watch --stop             # stop background daemon
+//   crosstalk-watch --status           # check if daemon is running
 //   crosstalk-watch --init             # copy smtp.conf.template
 
 import { readFileSync, existsSync, watch, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
@@ -62,7 +62,7 @@ export function daemonize() {
       const existingPid = parseInt(readFileSync(PID_PATH, "utf8").trim(), 10);
       if (existingPid && isAlive(existingPid)) {
         console.error(`crosstalk-watch: daemon already running (pid ${existingPid})`);
-        console.error("  Use:  crosstalk-watch --daemon --stop");
+        console.error("  Use:  crosstalk-watch --stop");
         process.exit(1);
       }
     } catch { /* stale pid file */ }
@@ -86,7 +86,7 @@ export function daemonize() {
   console.error(`crosstalk-watch: daemon started (pid ${child.pid})`);
   console.error(`  Watching: ${INBOX_PATH}`);
   console.error(`  PID file: ${PID_PATH}`);
-  console.error("  To stop:  crosstalk-watch --daemon --stop");
+  console.error("  To stop:  crosstalk-watch --stop");
   process.exit(0);
 }
 
@@ -302,6 +302,17 @@ async function checkAndNotify() {
 }
 
 // ── File watcher ─────────────────────────────────────────────────────────────
+
+export function testOnce() {
+  console.error("crosstalk-watch: checking inbox once");
+  mkdirSync(WATCHER_DIR, { recursive: true, mode: 0o700 });
+  checkAndNotify()
+    .then(() => process.exit(0))
+    .catch((e) => {
+      console.error(`crosstalk-watch: check failed: ${e.message}`);
+      process.exit(1);
+    });
+}
 
 export function startWatcher() {
   console.error("crosstalk-watch: watching", INBOX_PATH);

@@ -2,11 +2,11 @@
 // crosstalk-watch CLI — email notification for new crosstalk inbox messages.
 //
 // Usage:
-//   crosstalk-watch                        # run in foreground (Ctrl+C to stop)
-//   crosstalk-watch --daemon               # fork to background (runs until stopped)
-//   crosstalk-watch --daemon --stop        # stop the background daemon
-//   crosstalk-watch --daemon --status      # check if daemon is running
+//   crosstalk-watch                        # fork to background (daemon mode)
+//   crosstalk-watch --stop                 # stop the background daemon
+//   crosstalk-watch --status               # check if daemon is running
 //   crosstalk-watch --init                 # copy smtp.conf.template and print guide
+//   crosstalk-watch --test                 # check inbox once + send email (for testing)
 
 import { readFileSync, existsSync, copyFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -14,6 +14,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   startWatcher,
+  testOnce,
   daemonize,
   daemonStop,
   daemonStatus,
@@ -40,19 +41,19 @@ function cmdInit() {
 
   console.error("");
   console.error("1. Edit the file and fill in your SMTP settings.");
-  console.error("2. Run:  crosstalk-watch              # test in foreground");
-  console.error("3. Then: crosstalk-watch --daemon     # fork to background");
+  console.error("2. Run:  crosstalk-watch --test   # test email delivery");
+  console.error("3. Run:  crosstalk-watch           # start daemon");
   console.error("");
 }
 
 function showHelp() {
   console.error("Usage: crosstalk-watch [command]");
   console.error("");
-  console.error("  (no args)     Run the inbox watcher in the foreground");
-  console.error("  --daemon       Fork to background (daemon mode)");
-  console.error("  --daemon --stop   Stop the background daemon");
-  console.error("  --daemon --status Check if daemon is running");
+  console.error("  (no args)     Start the watcher as a background daemon");
+  console.error("  --stop         Stop the background daemon");
+  console.error("  --status       Check if the daemon is running");
   console.error("  --init         Copy smtp.conf.template to ~/.crosstalk/watcher/");
+  console.error("  --test         Check inbox once and send email (test config)");
   console.error("  --help         Show this message");
   console.error("");
 }
@@ -65,23 +66,18 @@ const args = process.argv.slice(2);
 // picks it up and just runs the watcher without any CLI dispatch.
 if (args[0] === "--daemon-child") {
   startWatcher();
-  // Don't call process.exit() here — startWatcher sets up the event loop
-  // (fs.watch, keep-alive interval) and the process must stay alive.
-}
-
-if (args[0] === "--daemon" || args[0] === "daemon") {
-  const sub = args[1];
-  if (sub === "--stop" || sub === "stop") {
-    daemonStop();
-  } else if (sub === "--status" || sub === "status") {
-    daemonStatus();
-  } else {
-    daemonize();
-  }
+  // Falls through to nothing — startWatcher owns the event loop
+} else if (args[0] === "--stop" || args[0] === "stop") {
+  daemonStop();
+} else if (args[0] === "--status" || args[0] === "status") {
+  daemonStatus();
 } else if (args[0] === "--init" || args[0] === "init") {
   cmdInit();
+} else if (args[0] === "--test" || args[0] === "test") {
+  testOnce();
 } else if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
   showHelp();
 } else {
-  startWatcher();
+  // Default: daemon mode
+  daemonize();
 }
