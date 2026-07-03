@@ -69,12 +69,19 @@ if (ready) {
   catch (e) { process.stderr.write(`crosstalk: signing identity unavailable (${e?.message || e}); sending unsigned\n`); }
 }
 
+// ── Peer name validation ──────────────────────────────────────────────────────
+const PEER_NAME_RE = /^[a-z][a-z0-9-]{1,31}$/;
+function validatePeerName(name) {
+  return typeof name === "string" && PEER_NAME_RE.test(name);
+}
+
 // Build the outbound envelope body, SIGNED when an identity is present.
 // The canonical fields {msg_id, from, to, subject, content, ts} are signed via the vendored
 // canonicalEnvelope — byte-identical to the receiver's. Fail-soft to unsigned on any signing error.
-// Build the outbound envelope body, SIGNED when an identity is present.
 // Returns { body (JSON string), msg_id } so callers don't need to re-parse.
 function buildBody({ from, to, subject, content }) {
+  if (!validatePeerName(from)) throw new Error(`invalid sender peer name: "${from}"`);
+  if (!validatePeerName(to)) throw new Error(`invalid recipient peer name: "${to}"`);
   const msg_id = randomBytes(8).toString("hex");
   const ts = new Date().toISOString();
   const base = { from, to, subject: subject || "", content, msg_id, ts };
@@ -97,7 +104,7 @@ async function creds() {
     identityPoolId: cognito.identityPoolId,
     username: cognito.username,
     refreshToken: cognito.refreshToken,
-    password: cognito.password,
+    password: cognito.password, // TODO: after first successful creds() call, clear cognito.password from memory to reduce exposure window
   });
 }
 
@@ -162,7 +169,7 @@ server.tool(
       const msg = String(e?.message || e);
       debug(`send_message: failed msg_id=${msg_id} error=${msg.slice(0, 200)}`);
       trackMessage(msg_id, { to, subject: subject || "", ts: new Date().toISOString(), status: "failed", detail: msg.slice(0, 200) });
-      const hint = /AccessDenied|not authorized/i.test(msg) ? ` — you don't have a grant to message "${to}" (ask the admin to grant it).` : "";
+      const hint = /AccessDenied|not authorized/i.test(msg) ? ` — you may not have a grant to message this peer, or the peer may not exist. Ask the admin to check.` : "";
       return { isError: true, content: [{ type: "text", text: `send failed: ${msg.split("\n").slice(-2).join(" ").slice(0, 300)}${hint}` }] };
     }
   },
@@ -234,7 +241,9 @@ server.tool(
       trackMessage(msg_id, { to, subject: subject || "re:", ts: new Date().toISOString(), status: "sent", detail: "queued to content screen" });
       return { content: [{ type: "text", text: `Reply sent to ${to} (MessageId ${sqsMsgId}). Message tracking id: ${msg_id}. Use check_message_status to check delivery outcome.` }] };
     } catch (e) {
-      return { isError: true, content: [{ type: "text", text: `reply failed: ${String(e?.message || e).split("\n").slice(-2).join(" ").slice(0, 300)}` }] };
+      const msg = String(e?.message || e);
+      const hint = /AccessDenied|not authorized/i.test(msg) ? ` — you may not have a grant to message this peer, or the peer may not exist. Ask the admin to check.` : "";
+      return { isError: true, content: [{ type: "text", text: `reply failed: ${msg.split("\n").slice(-2).join(" ").slice(0, 300)}${hint}` }] };
     }
   },
 );
@@ -274,10 +283,18 @@ async function pollOnce() {
   }
 }
 
+// Exponential backoff state for pollLoop error recovery
+let pollBackoff = 1; // seconds, doubles on each error, caps at 60, resets to 1 on success
+
 async function pollLoop() {
   for (;;) {
-    try { await pollOnce(); }
-    catch (e) { process.stderr.write(`crosstalk: poll error (${e?.message || e})\n`); await new Promise((r) => setTimeout(r, 5000)); }
+    try { await pollOnce(); pollBackoff = 1; }
+    catch (e) {
+      const waitMs = Math.min(pollBackoff * 1000, 60000);
+      process.stderr.write(`crosstalk: poll error (${e?.message || e}); retrying in ${waitMs / 1000}s\n`);
+      await new Promise((r) => setTimeout(r, waitMs));
+      pollBackoff = Math.min(pollBackoff * 2, 60);
+    }
   }
 }
 
@@ -287,5 +304,5 @@ if (ready) {
   if (n > 0) {
     process.stderr.write(`crosstalk: ${n} unread message(s) in the local inbox — call check_inbox to read them.\n`);
   }
-  pollLoop(); // fire-and-forget; the MCP stays responsive to tool calls
+  pollLoop().catch(e => process.stderr.write(`crosstalk: poll loop crashed (${e?.message || e})\n`));
 }
