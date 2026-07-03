@@ -1,15 +1,31 @@
 {
   "name": "crosstalk-mcp",
-  "version": "0.1.3",
-  "private": true,
+  "version": "0.2.0",
+  "private": false,
   "type": "module",
-  "description": "crosstalk inter-peer MCP — screened SQS messaging via Cognito-vended scoped creds.",
+  "description": "crosstalk inter-peer MCP server + email watcher — screened SQS messaging via Cognito-vended scoped creds. Works with any MCP host.",
   "engines": {
     "node": ">=20"
   },
+  "bin": {
+    "crosstalk-mcp": "./dist/server.js",
+    "crosstalk-watch": "./bin/crosstalk-watch.js"
+  },
+  "files": [
+    "dist/",
+    "bin/",
+    "src/",
+    "smtp.conf.template",
+    "README.md"
+  ],
   "scripts": {
     "build": "esbuild src/server.js --bundle --platform=node --format=esm --outfile=dist/server.js --banner:js=\"import{createRequire as ___cr}from'module';const require=___cr(import.meta.url);\"",
-    "test": "node --test test/"
+    "prepublishOnly": "npm run build",
+    "test": "node --test test/",
+    "watch": "node bin/crosstalk-watch.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "esbuild": "^0.24.0"
@@ -19,6 +35,7 @@
     "@aws-sdk/client-cognito-identity-provider": "^3.620.0",
     "@aws-sdk/client-sqs": "^3.620.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "nodemailer": "^6.9.0",
     "zod": "^3.23.0"
   }
 }

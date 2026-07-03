@@ -1,0 +1,39 @@
+# crosstalk watcher — SMTP configuration (TEMPLATE)
+# Copy this to smtp.conf and fill in your details:
+#   cp ~/.crosstalk/watcher/smtp.conf.template ~/.crosstalk/watcher/smtp.conf
+#
+# Then run:  bash ~/.crosstalk/watcher/install.sh
+
+# ═══ Pick ONE provider below — uncomment and fill in ═══════════════════════════
+
+# --- Gmail ---
+# Requires an "App Password" (NOT your login password).
+# Create one at: https://myaccount.google.com/apppasswords
+#   (Enable 2FA first if you haven't; then "App passwords" appears)
+#
+SMTP_HOST="smtp.gmail.com"
+SMTP_PORT="587"
+SMTP_USER="yourname@gmail.com"
+SMTP_PASS="abcd efgh ijkl mnop"
+SMTP_FROM="yourname@gmail.com"
+
+# --- Outlook / Office 365 ---
+#SMTP_HOST="smtp.office365.com"
+#SMTP_PORT="587"
+#SMTP_USER="you@outlook.com"
+#SMTP_PASS="your-app-password-here"
+#SMTP_FROM="you@outlook.com"
+
+# --- Custom SMTP (any provider) ---
+#SMTP_HOST="smtp.example.com"
+#SMTP_PORT="587"
+#SMTP_USER="user@example.com"
+#SMTP_PASS="your-password"
+#SMTP_FROM="user@example.com"
+
+# ═══ Notification target ══════════════════════════════════════════════════════
+NOTIFY_TO="you@example.com"
+
+# ═══ Throttle ══════════════════════════════════════════════════════════════════
+# Minimum seconds between email notifications (prevents spam on rapid changes)
+MIN_INTERVAL=60

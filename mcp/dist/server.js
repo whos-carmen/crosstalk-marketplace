@@ -59032,10 +59032,6 @@ async function creds() {
     clientId: cognito.clientId,
     identityPoolId: cognito.identityPoolId,
     username: cognito.username,
-    // #2 — forward the refresh token. The portal flow is refresh-token-ONLY (no password), so
-    // without this resolveCognitoCreds saw neither and threw "no refreshToken and no password".
-    // resolveCognitoCreds prefers refreshToken over password (REFRESH_TOKEN_AUTH); password is the
-    // legacy first-auth fallback only.
     refreshToken: cognito.refreshToken,
     password: cognito.password
   });
@@ -59050,10 +59046,9 @@ function notReadyResult() {
   };
 }
 var INBOX_STORE = process.env.CROSSTALK_INBOX_STORE || join7(homedir3(), ".crosstalk", "inbox.jsonl");
-var AUTOPOLL = (process.env.CROSSTALK_AUTOPOLL || "1") !== "0";
 var server = new McpServer(
   { name: "crosstalk", version: "0.1.0" },
-  { capabilities: { tools: {}, experimental: { "claude/channel": {} } } }
+  { capabilities: { tools: {} } }
 );
 server.tool(
   "send_message",
@@ -59075,15 +59070,14 @@ server.tool(
 );
 server.tool(
   "check_inbox",
-  "Fetch and acknowledge new crosstalk messages from your own inbox.",
+  "Fetch and acknowledge new crosstalk messages from your own inbox. Reads from the local store (populated by the external auto-poller). Messages are marked as read automatically.",
   { limit: external_exports.number().int().min(1).max(10).optional() },
   async ({ limit }) => {
     if (!ready) return notReadyResult();
     try {
-      if (AUTOPOLL) {
-        const msgs2 = takeUnread(INBOX_STORE, limit || 10);
-        if (!msgs2.length) return { content: [{ type: "text", text: "No new messages." }] };
-        const out2 = msgs2.map((p3) => `from ${p3.from || "?"}${p3.subject ? ` [${p3.subject}]` : ""}: ${p3.content || ""}`);
+      const stored = takeUnread(INBOX_STORE, limit || 10);
+      if (stored.length) {
+        const out2 = stored.map((p3) => `from ${p3.from || "?"}${p3.subject ? ` [${p3.subject}]` : ""}: ${p3.content || ""}`);
         return { content: [{ type: "text", text: out2.join("\n\n") }] };
       }
       const c5 = await creds();
@@ -59141,28 +59135,6 @@ Send the fingerprint to the network admin out-of-band so they can pin your key.`
 );
 var transport = new StdioServerTransport();
 await server.connect(transport);
-function pushChannel(msg) {
-  try {
-    server.server.notification({
-      method: "notifications/claude/channel",
-      params: {
-        content: `${msg.from || "?"}${msg.subject ? ` [${msg.subject}]` : ""}: ${msg.content || ""}`,
-        meta: {
-          type: String(msg.type || "message"),
-          from: String(msg.from || "?"),
-          from_id: String(msg.from || "?"),
-          message_id: String(msg.msg_id || msg.message_id || msg.id || ""),
-          thread_id: String(msg.thread_id || ""),
-          subject: String(msg.subject || ""),
-          ts: String(msg.ts || "")
-        }
-      }
-    });
-  } catch (e5) {
-    process.stderr.write(`crosstalk: channel push failed (${e5?.message || e5})
-`);
-  }
-}
 async function pollOnce() {
   const c5 = await creds();
   const msgs = await receiveMessages({ region: inbox.region, queueUrl: cfg.CROSSTALK_SQS_INBOX_URL, max: 10, waitSeconds: 20, creds: c5 });
@@ -59173,14 +59145,13 @@ async function pollOnce() {
     } catch {
       parsed = { content: m3.Body };
     }
-    const isNew = appendIfNew(INBOX_STORE, parsed);
+    appendIfNew(INBOX_STORE, parsed);
     try {
       await deleteMessage({ region: inbox.region, queueUrl: cfg.CROSSTALK_SQS_INBOX_URL, receiptHandle: m3.ReceiptHandle, creds: c5 });
     } catch (e5) {
       process.stderr.write(`crosstalk: ack failed (${e5?.message || e5})
 `);
     }
-    if (isNew) pushChannel(parsed);
   }
 }
 async function pollLoop() {
@@ -59194,12 +59165,11 @@ async function pollLoop() {
     }
   }
 }
-if (ready && AUTOPOLL) {
+if (ready) {
   const n3 = unreadCount(INBOX_STORE);
   if (n3 > 0) {
-    process.stderr.write(`crosstalk: ${n3} unread message(s) in the local inbox at startup
+    process.stderr.write(`crosstalk: ${n3} unread message(s) in the local inbox \u2014 call check_inbox to read them.
 `);
-    pushChannel({ from: "crosstalk", subject: "startup", content: `You have ${n3} unread crosstalk message(s) \u2014 call check_inbox to read them.`, msg_id: "startup-hint" });
   }
   pollLoop();
 }
