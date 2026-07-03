@@ -72,6 +72,8 @@ if (ready) {
 // Build the outbound envelope body, SIGNED when an identity is present.
 // The canonical fields {msg_id, from, to, subject, content, ts} are signed via the vendored
 // canonicalEnvelope — byte-identical to the receiver's. Fail-soft to unsigned on any signing error.
+// Build the outbound envelope body, SIGNED when an identity is present.
+// Returns { body (JSON string), msg_id } so callers don't need to re-parse.
 function buildBody({ from, to, subject, content }) {
   const msg_id = randomBytes(8).toString("hex");
   const ts = new Date().toISOString();
@@ -79,12 +81,12 @@ function buildBody({ from, to, subject, content }) {
   if (identity) {
     try {
       const sig = signCanonical(identity.privateKey, { msg_id, from, to, subject: subject || "", content, ts });
-      return JSON.stringify({ ...base, sig, advertised_pubkey: identity.pubkeyB64, from_node: from });
+      return { body: JSON.stringify({ ...base, sig, advertised_pubkey: identity.pubkeyB64, from_node: from }), msg_id };
     } catch (e) {
       process.stderr.write(`crosstalk: sign failed (${e?.message || e}); sending unsigned\n`);
     }
   }
-  return JSON.stringify(base);
+  return { body: JSON.stringify(base), msg_id };
 }
 
 async function creds() {
@@ -112,28 +114,18 @@ function notReadyResult() {
 const INBOX_STORE = process.env.CROSSTALK_INBOX_STORE || join(homedir(), ".crosstalk", "inbox.jsonl");
 
 // ── Sent-message tracking (in-memory) ─────────────────────────────────────────
-// Tracks recently sent messages and their inferred screening status.
+// Tracks recently sent messages and their ids for check_message_status queries.
 // Does not persist across restarts — useful for same-session diagnosis.
-const sentMessages = new Map(); // msg_id → { to, subject, ts, status, details, sqsMsgId? }
-
-// After sending to the screen queue, attempt a brief poll on the queue to
-// detect whether the screen has already consumed the message. If the message
-// is still visible, screening is pending. If it's gone, it was either accepted
-// or silently rejected — we can't distinguish server-side without async bounce
-// support from the screen function.
-async function checkScreenVerdict(queueUrl, creds, expectedBody, waitSeconds = 1) {
-  try {
-    const msgs = await receiveMessages({ region: inbox.region, queueUrl, max: 10, waitSeconds, creds });
-    for (const m of msgs) {
-      if (m.Body === expectedBody) {
-        return { status: "pending", detail: "still in the screen queue (not yet processed)" };
-      }
-    }
-    return { status: "consumed", detail: "consumed by the content screen (accepted or rejected)" };
-  } catch (e) {
-    debug("screen verdict poll failed:", e?.message);
-    return { status: "unknown", detail: `poll failed: ${e?.message}` };
+// Capped at 500 entries; oldest are evicted on overflow.
+const sentMessages = new Map(); // msg_id → { to, subject, ts, status, detail }
+const MAX_SENT_TRACKED = 500;
+function trackMessage(msg_id, data) {
+  if (sentMessages.size >= MAX_SENT_TRACKED) {
+    // Evict oldest entry
+    const firstKey = sentMessages.keys().next().value;
+    if (firstKey) sentMessages.delete(firstKey);
   }
+  sentMessages.set(msg_id, data);
 }
 
 const server = new McpServer(
@@ -147,8 +139,7 @@ server.tool(
   { to: z.string().describe("recipient peer name"), subject: z.string().optional(), content: z.string().describe("message body") },
   async ({ to, subject, content }) => {
     if (!ready) return notReadyResult();
-    const body = buildBody({ from: inbox.peer, to, subject: subject || "", content });
-    const msg_id = JSON.parse(body).msg_id;
+    const { body, msg_id } = buildBody({ from: inbox.peer, to, subject: subject || "", content });
     try {
       const c = await creds();
       const queueUrl = screenQueueUrl(inbox.region, inbox.account, to);
@@ -157,24 +148,20 @@ server.tool(
       const sqsMsgId = r.MessageId || "?";
       debug(`send_message: sent msg_id=${msg_id} sqsMsgId=${sqsMsgId}`);
 
-      // Track in memory
-      sentMessages.set(msg_id, { to, subject: subject || "", ts: new Date().toISOString(), status: "sent", detail: "queued to content screen" });
-
-      // Best-effort screen verdict check (1s poll)
-      const verdict = await checkScreenVerdict(queueUrl, c, body);
-      sentMessages.set(msg_id, { ...sentMessages.get(msg_id), status: verdict.status, detail: verdict.detail });
+      // Track in memory (screen verdict is not available server-side without
+      // consuming from the FIFO queue, which would block the screen Lambda)
+      trackMessage(msg_id, { to, subject: subject || "", ts: new Date().toISOString(), status: "sent", detail: "queued to content screen (verdict unknown — screen function processes asynchronously)" });
 
       const lines = [
         `Sent to ${to} via the content screen (MessageId ${sqsMsgId}).`,
         `Message tracking id: ${msg_id}.`,
-        `Screen verdict: ${verdict.detail}.`,
-        `You will NOT be notified if the screen rejects your message — use check_message_status to check delivery outcome.`,
+        `You will NOT be notified if the screen rejects your message — use check_message_status to poll delivery outcome.`,
       ];
       return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (e) {
       const msg = String(e?.message || e);
       debug(`send_message: failed msg_id=${msg_id} error=${msg.slice(0, 200)}`);
-      sentMessages.set(msg_id, { to, subject: subject || "", ts: new Date().toISOString(), status: "failed", detail: msg.slice(0, 200) });
+      trackMessage(msg_id, { to, subject: subject || "", ts: new Date().toISOString(), status: "failed", detail: msg.slice(0, 200) });
       const hint = /AccessDenied|not authorized/i.test(msg) ? ` — you don't have a grant to message "${to}" (ask the admin to grant it).` : "";
       return { isError: true, content: [{ type: "text", text: `send failed: ${msg.split("\n").slice(-2).join(" ").slice(0, 300)}${hint}` }] };
     }
@@ -196,8 +183,8 @@ server.tool(
     statusLine += `\nSent at: ${record.ts}`;
     statusLine += `\nStatus: ${record.status}`;
     statusLine += `\nDetail: ${record.detail}`;
-    if (record.status === "consumed") {
-      statusLine += `\n\nNote: "consumed" means the screen function processed the message. It was either forwarded to the recipient's inbox (accepted) or silently deleted (rejected). There is no server-side way to distinguish which — ask the recipient to check their inbox.`;
+    if (record.status === "sent") {
+      statusLine += `\n\nNote: The screen function processes messages asynchronously. This status only confirms the message was queued — it does not confirm delivery. Ask the recipient to check their inbox.`;
     }
     return { content: [{ type: "text", text: statusLine }] };
   },
@@ -239,11 +226,13 @@ server.tool(
   { to: z.string(), content: z.string(), subject: z.string().optional() },
   async ({ to, content, subject }) => {
     if (!ready) return notReadyResult();
-    const body = buildBody({ from: inbox.peer, to, subject: subject || "re:", content });
+    const { body, msg_id } = buildBody({ from: inbox.peer, to, subject: subject || "re:", content });
     try {
       const c = await creds();
       const r = await sendMessage({ region: inbox.region, queueUrl: screenQueueUrl(inbox.region, inbox.account, to), body, creds: c });
-      return { content: [{ type: "text", text: `Reply sent to ${to} (MessageId ${r.MessageId || "?"}) — queued to content screen. Use check_message_status with the tracking id to check delivery.` }] };
+      const sqsMsgId = r.MessageId || "?";
+      trackMessage(msg_id, { to, subject: subject || "re:", ts: new Date().toISOString(), status: "sent", detail: "queued to content screen" });
+      return { content: [{ type: "text", text: `Reply sent to ${to} (MessageId ${sqsMsgId}). Message tracking id: ${msg_id}. Use check_message_status to check delivery outcome.` }] };
     } catch (e) {
       return { isError: true, content: [{ type: "text", text: `reply failed: ${String(e?.message || e).split("\n").slice(-2).join(" ").slice(0, 300)}` }] };
     }
