@@ -9,7 +9,7 @@
 //   crosstalk-watch --status           # check if daemon is running
 //   crosstalk-watch --init             # copy smtp.conf.template
 
-import { readFileSync, existsSync, watch, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, watch, mkdirSync, writeFileSync, unlinkSync, statSync, renameSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
@@ -161,8 +161,20 @@ function loadState() {
 
 async function saveState(state) {
   try {
+    // Prune unbounded state.seen growth
+    const keys = Object.keys(state.seen);
+    if (keys.length > 1000) {
+      const pruned = {};
+      const recent = keys.slice(-200);
+      for (const k of recent) pruned[k] = state.seen[k];
+      state.seen = pruned;
+    }
+
     mkdirSync(WATCHER_DIR, { recursive: true, mode: 0o700 });
-    await writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+    // Atomic write: write to temp file, then rename
+    const tmpPath = STATE_PATH + ".tmp." + process.pid;
+    await writeFile(tmpPath, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmpPath, STATE_PATH);
   } catch (e) {
     console.error(`crosstalk-watch: failed to save state: ${e.message}`);
   }
@@ -220,6 +232,8 @@ async function sendEmail(config, newMessages, unreadCount) {
     port,
     secure: port === 465,
     auth: { user, pass },
+    connectionTimeout: 10000,
+    socketTimeout: 15000,
   });
 
   try {
@@ -240,6 +254,16 @@ async function sendEmail(config, newMessages, unreadCount) {
 // ── Main check logic ─────────────────────────────────────────────────────────
 
 async function checkAndNotify() {
+  if (checkInProgress) return;
+  checkInProgress = true;
+  try {
+    await _checkAndNotify();
+  } finally {
+    checkInProgress = false;
+  }
+}
+
+async function _checkAndNotify() {
   if (!existsSync(INBOX_PATH)) return;
 
   const config = loadConfig(CONFIG_PATH);
@@ -283,9 +307,6 @@ async function checkAndNotify() {
 
   if (newMessages.length === 0) return;
 
-  // Save last run time
-  await writeFile(LAST_RUN_PATH, String(now), "utf8").catch(() => {});
-
   // Count total unread
   let unreadCount = 0;
   for (const line of lines) {
@@ -295,10 +316,13 @@ async function checkAndNotify() {
     } catch { /* skip */ }
   }
 
-  await sendEmail(config, newMessages, unreadCount);
+  const sent = await sendEmail(config, newMessages, unreadCount);
 
-  // Persist updated state
-  await saveState(state);
+  // Only persist state if email was sent successfully
+  if (sent) {
+    await writeFile(LAST_RUN_PATH, String(now), "utf8").catch(() => {});
+    await saveState(state);
+  }
 }
 
 // ── File watcher (resilient) ────────────────────────────────────────────────
@@ -318,6 +342,7 @@ async function checkAndNotify() {
 let currentWatcher = null;
 let debounceTimer = null;
 let fallbackTimer = null;
+let checkInProgress = false;
 
 // File stat tracking for inode re-arm and fallback polling
 let lastKnownIno = null;
@@ -359,7 +384,7 @@ function setupWatcher() {
   }
 
   try {
-    currentWatcher = watch(INBOX_PATH, { persistent: false }, (eventType) => {
+    currentWatcher = watch(INBOX_PATH, (eventType) => {
       // Re-arm if inode changed (atomic rename pattern)
       rearmIfInodeChanged();
       // Debounce coalesced events
@@ -390,13 +415,15 @@ function setupFallbackPoll() {
   fallbackTimer = setInterval(() => {
     try {
       const stat = statSync(INBOX_PATH);
+      // Save inode before refreshFileStat overwrites lastKnownIno
       if (stat.size !== lastKnownSize || stat.mtimeMs !== lastKnownMtime) {
         // fs.watch missed something — process it
-        refreshFileStat();
+        // Check inode BEFORE refreshFileStat overwrites lastKnownIno
         if (stat.ino && stat.ino !== lastKnownIno) {
           lastKnownIno = stat.ino;
           setupWatcher();
         }
+        refreshFileStat();
         checkAndNotify().catch((e) => {
           console.error(`crosstalk-watch: poll notify failed: ${e.message}`);
         });
@@ -423,6 +450,11 @@ export function startWatcher() {
   // Ensure watcher dir exists
   mkdirSync(WATCHER_DIR, { recursive: true, mode: 0o700 });
 
+  // Ensure inbox file exists before statting or watching it
+  if (!existsSync(INBOX_PATH)) {
+    writeFileSync(INBOX_PATH, "", { mode: 0o600 });
+  }
+
   // Get baseline file stat
   refreshFileStat();
 
@@ -431,18 +463,11 @@ export function startWatcher() {
     console.error(`crosstalk-watch: initial check failed: ${e.message}`);
   });
 
-  if (!existsSync(INBOX_PATH)) {
-    writeFile(INBOX_PATH, "").catch(() => {});
-  }
-
   // Set up resilient fs.watch
   setupWatcher();
 
   // Always run fallback polling (catches silent watcher death)
   setupFallbackPoll();
-
-  // Keep alive — detached daemon children need at least one active handle
-  setInterval(() => {}, 300_000);
 
   process.on("SIGINT", () => { process.exit(0); });
   process.on("SIGTERM", () => { process.exit(0); });

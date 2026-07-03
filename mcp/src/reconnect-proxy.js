@@ -38,6 +38,7 @@ let pendingRequests = new Map();
 let requestBuffer = [];
 let draining = false;
 let healthy = false;
+let shuttingDown = false;
 
 // ── JSON-RPC helpers ─────────────────────────────────────────────────────────
 
@@ -89,6 +90,8 @@ function isNotification(line) {
 // ── Child process management ─────────────────────────────────────────────────
 
 function startChild() {
+  if (shuttingDown) return;
+
   if (child) {
     try { child.kill(); } catch { /* ignore */ }
     child = null;
@@ -112,11 +115,21 @@ function startChild() {
 
   // Forward child's stdout → our stdout (responses from server to host)
   // Intercept to track in-flight request resolution
+  let firstLineReceived = false;
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
   rl.on("line", (line) => {
     if (isJsonRpcResponse(line)) {
       const id = parseId(line);
       if (id !== null) pendingRequests.delete(id);
+    }
+    // Mark healthy on first response line from child
+    if (!firstLineReceived) {
+      firstLineReceived = true;
+      if (!healthy && !childExited) {
+        healthy = true;
+        process.stderr.write("crosstalk-proxy: child is ready\n");
+        drainBuffer();
+      }
     }
     // Forward to host regardless
     process.stdout.write(line + "\n");
@@ -147,9 +160,26 @@ function startChild() {
       ));
     }
 
+    // Fail any remaining buffered requests
+    for (const line of requestBuffer) {
+      if (isJsonRpcRequest(line)) {
+        const id = parseId(line);
+        if (id !== null) {
+          let method = "(unknown)";
+          try { method = JSON.parse(line).method; } catch { /* ignore */ }
+          process.stdout.write(buildErrorResponse(
+            id,
+            -32000,
+            `Server error: child process crashed (${reason}). The request "${method}" was not completed. The server is being respawned.`,
+          ));
+        }
+      }
+    }
+    requestBuffer.length = 0;
+
     // Decide whether to respawn
     crashCount++;
-    if (crashCount > MAX_CONSECUTIVE_CRASHES) {
+    if (crashCount >= MAX_CONSECUTIVE_CRASHES) {
       process.stderr.write(
         `crosstalk-proxy: ${MAX_CONSECUTIVE_CRASHES} consecutive crashes — giving up.\n`,
       );
@@ -161,9 +191,10 @@ function startChild() {
     process.stderr.write(
       `crosstalk-proxy: respawning in ${Math.round(waitMs / 1000)}s (attempt #${crashCount})...\n`,
     );
-    backoffMs *= BACKOFF_FACTOR;
+    backoffMs = Math.min(backoffMs * BACKOFF_FACTOR, MAX_BACKOFF_MS);
 
     setTimeout(() => {
+      if (shuttingDown) return;
       if (!childExited) return; // already restarted
       startChild();
     }, waitMs);
@@ -172,16 +203,6 @@ function startChild() {
   child.on("error", (err) => {
     process.stderr.write(`crosstalk-proxy: child error (${err.message})\n`);
     // 'exit' will fire after 'error', so respawn logic is there
-  });
-
-  // Mark healthy once the child is ready
-  child.stdout.on("readable", () => {
-    if (childExited) return;
-    if (!healthy) {
-      healthy = true;
-      process.stderr.write("crosstalk-proxy: child is ready\n");
-      drainBuffer();
-    }
   });
 
   // Heuristic: if no data arrives within 100ms, assume child is ready
@@ -240,7 +261,11 @@ stdinRl.on("line", (line) => {
   }
 
   if (!healthy) {
-    requestBuffer.push(line);
+    if (isJsonRpcRequest(line)) {
+      requestBuffer.push(line);
+    } else if (isNotification(line)) {
+      process.stderr.write("crosstalk-proxy: dropped notification (child not ready)\n");
+    }
     return;
   }
 
@@ -250,9 +275,18 @@ stdinRl.on("line", (line) => {
 // ── Signal handling ──────────────────────────────────────────────────────────
 
 function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   process.stderr.write(`crosstalk-proxy: received ${signal}, shutting down child\n`);
   if (child && !childExited) {
     child.kill(signal === "SIGTERM" ? "SIGTERM" : "SIGINT");
+    // Escalate to SIGKILL after 500ms if child hasn't exited
+    setTimeout(() => {
+      if (child && !childExited) {
+        process.stderr.write("crosstalk-proxy: child did not exit after SIGTERM/SIGINT, sending SIGKILL\n");
+        child.kill("SIGKILL");
+      }
+    }, 500).unref();
   }
   setTimeout(() => process.exit(0), 2000);
 }
@@ -261,6 +295,8 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 process.stdin.on("end", () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
   process.stderr.write("crosstalk-proxy: stdin closed (host disconnected), shutting down\n");
   if (child && !childExited) child.kill("SIGTERM");
   setTimeout(() => process.exit(0), 1000);
@@ -281,7 +317,7 @@ process.stderr.write(
 startChild();
 
 setInterval(() => {
-  if (!child && childExited && crashCount > MAX_CONSECUTIVE_CRASHES) {
+  if (!child && childExited && crashCount >= MAX_CONSECUTIVE_CRASHES) {
     process.exit(1);
   }
 }, 5000).unref();
