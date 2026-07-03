@@ -1,8 +1,10 @@
 # crosstalk watcher — SMTP configuration (TEMPLATE)
 # Copy this to smtp.conf and fill in your details:
-#   cp ~/.crosstalk/watcher/smtp.conf.template ~/.crosstalk/watcher/smtp.conf
+#   crosstalk-watch --init
 #
-# Then run:  bash ~/.crosstalk/watcher/install.sh
+# Then start the watcher:
+#   crosstalk-watch          # foreground (test it first)
+#   crosstalk-watch --daemon # background (stop with --daemon --stop)
 
 # ═══ Pick ONE provider below — uncomment and fill in ═══════════════════════════
 

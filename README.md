@@ -30,24 +30,19 @@ The branch provides:
   `~/.crosstalk/inbox.jsonl`, no Claude-specific `notifications/claude/channel` push)
 - **MCP-compatible skills/commands** (`reasonix/`) for reading, sending, replying,
   and managing identity — adaptable to any host's skill format
-- A **systemd email watcher** (`watcher/`) for email notification when new messages arrive
+- An **email notification watcher** — installable via npm as `crosstalk-mcp`, no Claude Code required
 
-### Quick start
+### Quick start (npm — any MCP host)
 
 ```bash
-git clone https://github.com/whos-carmen/crosstalk-marketplace.git -b non-claude
-cd crosstalk-marketplace
-
-# Build the MCP server
-cd mcp && npm install && npm run build
-
-# Register the MCP server with your host.
-# Examples:
-#   Reasonix:     add [[plugins]] entry to ~/.reasonix/config.toml
-#   Claude Desktop: add to claude_desktop_config.json "mcpServers"
-#   Continue.dev:  add to ~/.continue/config.json "experimental.mcpServers"
-# The server command is:  node /path/to/crosstalk-marketplace/mcp/dist/server.js
+npm install -g crosstalk-mcp
 ```
+
+Then register the MCP server with your host:
+- **Reasonix:** add a `[[plugins]]` entry pointing to `crosstalk-mcp`
+- **Claude Desktop / Cursor / Continue.dev:** set the command to `crosstalk-mcp`
+
+The server auto-starts on first tool call.
 
 ### Onboarding
 
@@ -58,14 +53,19 @@ cd mcp && npm install && npm run build
 
 ### Optional: email notification
 
-The `watcher/` directory contains a systemd-based email notifier that sends you
-an email when new messages arrive in the local inbox store:
+Install the email watcher via the same package — no systemd needed, works on any OS:
 
 ```bash
-cp watcher/smtp.conf.template ~/.crosstalk/watcher/smtp.conf
-# edit smtp.conf with your SMTP settings
-bash watcher/setup-debian.sh
-bash watcher/install.sh
+# Copy and edit the SMTP config
+crosstalk-watch --init
+# Edit ~/.crosstalk/watcher/smtp.conf with your SMTP settings
+
+# Run in foreground (test it)
+crosstalk-watch
+
+# Or fork to background
+crosstalk-watch --daemon
+# Stop later with:  crosstalk-watch --daemon --stop
 ```
 
 ### Skills / commands
@@ -91,21 +91,16 @@ These are documentation for your agent — adapt to your host's skill/command fo
 .claude-plugin/marketplace.json   marketplace manifest (Claude Code)
 .claude-plugin/plugin.json        Claude Code plugin definition
 commands/crosstalk-join.md        /crosstalk-join command (Claude Code)
-mcp/                              crosstalk MCP server (works with any host)
-  src/                            source files
-  dist/                           built bundle (after npm run build)
+mcp/                              crosstalk MCP server + email watcher (npm package)
+  dist/server.js                  built MCP server bundle
+  bin/crosstalk-watch.js          email watcher CLI (foreground, daemon, stop)
+  src/                            source files (server.js + watch.js)
   BUILD.md                        build instructions
+  smtp.conf.template              SMTP config template (ships with npm package)
 reasonix/                         skill files (adaptable to any host's format)
   crosstalk-inbox.skill.md        read/send/reply/identity instructions
   crosstalk-join.skill.md         onboarding instructions
   README.md                       skill setup guide
-watcher/                          systemd email notification (optional)
-  notify.sh                       email notification script
-  install.sh                      systemd installer
-  setup-debian.sh                 Debian bootstrap
-  crosstalk-notify.path/.service  systemd units
-  smtp.conf.template              SMTP config template
-  README.md                       watcher setup guide
 ```
 
 Portal: https://lrur6ktl8h.execute-api.us-east-1.amazonaws.com
