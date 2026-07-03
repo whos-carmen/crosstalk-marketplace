@@ -301,7 +301,110 @@ async function checkAndNotify() {
   await saveState(state);
 }
 
-// ── File watcher ─────────────────────────────────────────────────────────────
+// ── File watcher (resilient) ────────────────────────────────────────────────
+//
+// == fs.watch resilience ==
+// - Inode-change re-arm: on each change, stat the file; if inode changed
+//   (atomic rename / write-tmp-then-rename), close the old watcher and
+//   create a new one. This prevents silent drop on macOS (kqueue tracks
+//   by inode, not path).
+// - Debounce: coalesces rapid change events within 100ms, collapsing
+//   rename+change into one notification.
+// - Fallback polling: a 30s interval stats the file and compares mtime;
+//   catches events fs.watch silently dropped (common on macOS under
+//   rename-heavy traffic).
+// - Error recovery: on watcher 'error', close and re-create.
+
+let currentWatcher = null;
+let debounceTimer = null;
+let fallbackTimer = null;
+
+// File stat tracking for inode re-arm and fallback polling
+let lastKnownIno = null;
+let lastKnownMtime = 0;
+let lastKnownSize = 0;
+
+const FALLBACK_POLL_MS = 30_000;
+const DEBOUNCE_MS = 100;
+
+function refreshFileStat() {
+  try {
+    const stat = statSync(INBOX_PATH);
+    lastKnownSize = stat.size;
+    lastKnownMtime = stat.mtimeMs;
+    lastKnownIno = stat.ino || null;
+  } catch {
+    lastKnownSize = 0;
+    lastKnownMtime = 0;
+    lastKnownIno = null;
+  }
+}
+
+function rearmIfInodeChanged() {
+  try {
+    const stat = statSync(INBOX_PATH);
+    if (stat.ino && stat.ino !== lastKnownIno) {
+      // Inode changed — file was replaced; re-arm the watcher
+      lastKnownIno = stat.ino;
+      setupWatcher();
+    }
+  } catch { /* file may not exist momentarily; polling will catch it */ }
+}
+
+function setupWatcher() {
+  // Close previous watcher
+  if (currentWatcher) {
+    try { currentWatcher.close(); } catch { /* ignore */ }
+    currentWatcher = null;
+  }
+
+  try {
+    currentWatcher = watch(INBOX_PATH, { persistent: false }, (eventType) => {
+      // Re-arm if inode changed (atomic rename pattern)
+      rearmIfInodeChanged();
+      // Debounce coalesced events
+      debouncedNotify();
+    });
+
+    currentWatcher.on("error", (err) => {
+      console.error(`crosstalk-watch: fs.watch error (${err.message}), re-creating`);
+      setupWatcher();
+    });
+  } catch (err) {
+    console.error(`crosstalk-watch: fs.watch setup failed (${err.message}), relying on fallback polling`);
+  }
+}
+
+function debouncedNotify() {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    debounceTimer = null;
+    checkAndNotify().catch((e) => {
+      console.error(`crosstalk-watch: notify failed: ${e.message}`);
+    });
+  }, DEBOUNCE_MS);
+}
+
+function setupFallbackPoll() {
+  if (fallbackTimer) clearInterval(fallbackTimer);
+  fallbackTimer = setInterval(() => {
+    try {
+      const stat = statSync(INBOX_PATH);
+      if (stat.size !== lastKnownSize || stat.mtimeMs !== lastKnownMtime) {
+        // fs.watch missed something — process it
+        refreshFileStat();
+        if (stat.ino && stat.ino !== lastKnownIno) {
+          lastKnownIno = stat.ino;
+          setupWatcher();
+        }
+        checkAndNotify().catch((e) => {
+          console.error(`crosstalk-watch: poll notify failed: ${e.message}`);
+        });
+      }
+    } catch { /* file may not exist; skip this tick */ }
+  }, FALLBACK_POLL_MS);
+  if (fallbackTimer.unref) fallbackTimer.unref();
+}
 
 export function testOnce() {
   console.error("crosstalk-watch: checking inbox once");
@@ -320,38 +423,25 @@ export function startWatcher() {
   // Ensure watcher dir exists
   mkdirSync(WATCHER_DIR, { recursive: true, mode: 0o700 });
 
-  // Run once immediately (fire-and-forget, promise rejection caught)
+  // Get baseline file stat
+  refreshFileStat();
+
+  // Run once immediately (fire-and-forget)
   checkAndNotify().catch((e) => {
     console.error(`crosstalk-watch: initial check failed: ${e.message}`);
   });
 
   if (!existsSync(INBOX_PATH)) {
-    // Create the file so we can watch it
     writeFile(INBOX_PATH, "").catch(() => {});
   }
 
-  // Watch for changes
-  try {
-    watch(INBOX_PATH, (eventType) => {
-      if (eventType === "change") {
-        checkAndNotify().catch((e) => {
-          console.error(`crosstalk-watch: notify failed: ${e.message}`);
-        });
-      }
-    });
-  } catch (e) {
-    console.error(`crosstalk-watch: failed to watch inbox: ${e.message}`);
-    // Fall back to polling every 30s
-    setInterval(() => {
-      checkAndNotify().catch((e) => {
-        console.error(`crosstalk-watch: poll failed: ${e.message}`);
-      });
-    }, 30000);
-  }
+  // Set up resilient fs.watch
+  setupWatcher();
+
+  // Always run fallback polling (catches silent watcher death)
+  setupFallbackPoll();
 
   // Keep alive — detached daemon children need at least one active handle
-  // to keep the event loop running, and unhandled promise rejections would
-  // terminate the process. Both guards are in place below.
   setInterval(() => {}, 300_000);
 
   process.on("SIGINT", () => { process.exit(0); });

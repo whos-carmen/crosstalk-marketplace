@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "bin": {
-    "crosstalk-mcp": "./dist/server.js",
+    "crosstalk-mcp": "./dist/reconnect-proxy.js",
     "crosstalk-watch": "./bin/crosstalk-watch.js"
   },
   "files": [
@@ -19,9 +19,11 @@
     "README.md"
   ],
   "scripts": {
-    "build": "esbuild src/server.js --bundle --platform=node --format=esm --outfile=dist/server.js --banner:js=\"import{createRequire as ___cr}from'module';const require=___cr(import.meta.url);\"",
+    "build": "npm run build:server && npm run build:proxy",
+    "build:server": "esbuild src/server.js --bundle --platform=node --format=esm --outfile=dist/server.js --banner:js=\"import{createRequire as ___cr}from'module';const require=___cr(import.meta.url);\"",
+    "build:proxy": "esbuild src/reconnect-proxy.js --bundle --platform=node --format=esm --outfile=dist/reconnect-proxy.js --banner:js=\"import{createRequire as ___cr}from'module';const require=___cr(import.meta.url);\"",
     "prepublishOnly": "npm run build",
-    "test": "node --test test/",
+    "test": "node --test 'test/**/*.test.js'",
     "watch": "node bin/crosstalk-watch.js"
   },
   "publishConfig": {
