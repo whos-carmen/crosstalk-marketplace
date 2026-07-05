@@ -39,6 +39,13 @@ let requestBuffer = [];
 let draining = false;
 let healthy = false;
 let shuttingDown = false;
+let spawnedAt = 0;
+const MIN_SURVIVAL_MS = 5_000;
+
+// ── MCP handshake cache (for replay on respawn) ──────────────────────────────
+let cachedInitializeRequest = null;  // raw JSON line of the initialize request
+let cachedInitializeResponse = null; // raw JSON line of the initialize response
+let pendingReplay = false;           // true while replaying handshake to new child
 
 // ── JSON-RPC helpers ─────────────────────────────────────────────────────────
 
@@ -108,8 +115,7 @@ function startChild() {
   });
 
   child.on("spawn", () => {
-    crashCount = 0;
-    backoffMs = INITIAL_BACKOFF_MS;
+    spawnedAt = Date.now();
     process.stderr.write(`crosstalk-proxy: child spawned (pid ${child.pid})\n`);
   });
 
@@ -122,13 +128,25 @@ function startChild() {
       const id = parseId(line);
       if (id !== null) pendingRequests.delete(id);
     }
+    // Intercept initialize response — cache it for replay on future respawns
+    if (cachedInitializeRequest && !cachedInitializeResponse && isJsonRpcResponse(line)) {
+      try {
+        const resp = JSON.parse(line);
+        const initReq = JSON.parse(cachedInitializeRequest);
+        if (resp.id === initReq.id && !resp.error) {
+          cachedInitializeResponse = line;
+          process.stderr.write("crosstalk-proxy: cached initialize response\n");
+        }
+      } catch { /* ignore parse errors */ }
+    }
+
     // Mark healthy on first response line from child
     if (!firstLineReceived) {
       firstLineReceived = true;
       if (!healthy && !childExited) {
         healthy = true;
         process.stderr.write("crosstalk-proxy: child is ready\n");
-        drainBuffer();
+        replayOrDrain();
       }
     }
     // Forward to host regardless
@@ -179,6 +197,19 @@ function startChild() {
 
     // Decide whether to respawn
     crashCount++;
+
+    // Lifespan-gated reset: only credit the child if it actually survived
+    // for a meaningful period. A spawn that dies in < MIN_SURVIVAL_MS is still
+    // part of the same crash loop.
+    const lifespan = Date.now() - spawnedAt;
+    if (lifespan >= MIN_SURVIVAL_MS) {
+      process.stderr.write(
+        `crosstalk-proxy: child survived ${Math.round(lifespan / 1000)}s — resetting crash counter\n`,
+      );
+      crashCount = 0;
+      backoffMs = INITIAL_BACKOFF_MS;
+    }
+
     if (crashCount >= MAX_CONSECUTIVE_CRASHES) {
       process.stderr.write(
         `crosstalk-proxy: ${MAX_CONSECUTIVE_CRASHES} consecutive crashes — giving up.\n`,
@@ -211,7 +242,7 @@ function startChild() {
     if (!healthy) {
       healthy = true;
       process.stderr.write("crosstalk-proxy: child assumed ready\n");
-      drainBuffer();
+      replayOrDrain();
     }
   }, 100);
   if (readyTimer.unref) readyTimer.unref();
@@ -225,6 +256,47 @@ function drainBuffer() {
     forwardRequest(line);
   }
   draining = false;
+}
+
+// ── MCP handshake replay ────────────────────────────────────────────────────
+
+// When a child respawns, the MCP protocol requires a fresh initialize handshake
+// before any other request. We replay the cached initialize request to the new
+// child, wait for its response, then drain the buffered requests.
+function replayOrDrain() {
+  if (!cachedInitializeRequest || cachedInitializeResponse) {
+    // No handshake cached, or already have a response — just drain
+    drainBuffer();
+    return;
+  }
+
+  if (!child || childExited || !child.stdin.writable) return;
+
+  pendingReplay = true;
+  process.stderr.write("crosstalk-proxy: replaying initialize handshake to new child\n");
+
+  // Generate a fresh id for the replayed request so we can match the response
+  try {
+    const initReq = JSON.parse(cachedInitializeRequest);
+    const freshId = `replay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const replayLine = JSON.stringify({ ...initReq, id: freshId });
+
+    // Send the initialize request to the new child.
+    // The response will be forwarded to host — a second initialize response
+    // is harmless and keeps the MCP session state consistent for the host.
+    child.stdin.write(replayLine + "\n");
+
+    // Give the child a moment to process initialize, then drain buffered requests
+    setTimeout(() => {
+      pendingReplay = false;
+      process.stderr.write("crosstalk-proxy: handshake replay sent, draining buffer\n");
+      drainBuffer();
+    }, 200);
+  } catch (err) {
+    pendingReplay = false;
+    process.stderr.write(`crosstalk-proxy: handshake replay failed (${err.message}), draining anyway\n`);
+    drainBuffer();
+  }
 }
 
 // ── Request forwarding ───────────────────────────────────────────────────────
@@ -267,6 +339,17 @@ stdinRl.on("line", (line) => {
       process.stderr.write("crosstalk-proxy: dropped notification (child not ready)\n");
     }
     return;
+  }
+
+  // Intercept initialize request — cache it for replay on future respawns
+  if (!cachedInitializeRequest) {
+    try {
+      const msg = JSON.parse(line);
+      if (msg && msg.method === "initialize") {
+        cachedInitializeRequest = line;
+        process.stderr.write("crosstalk-proxy: cached initialize request\n");
+      }
+    } catch { /* ignore parse errors */ }
   }
 
   forwardRequest(line);

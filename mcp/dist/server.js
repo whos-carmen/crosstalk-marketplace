@@ -7058,7 +7058,7 @@ var init_MiddlewareStack = __esm({
         });
         return expandedMiddlewareList;
       };
-      const getMiddlewareList = (debug = false) => {
+      const getMiddlewareList = (debug2 = false) => {
         const normalizedAbsoluteEntries = [];
         const normalizedRelativeEntries = [];
         const normalizedEntriesNameMap = {};
@@ -7088,7 +7088,7 @@ var init_MiddlewareStack = __esm({
           if (entry.toMiddleware) {
             const toMiddleware = normalizedEntriesNameMap[entry.toMiddleware];
             if (toMiddleware === void 0) {
-              if (debug) {
+              if (debug2) {
                 return;
               }
               throw new Error(`${entry.toMiddleware} is not found when adding ${getMiddlewareNameWithAliases(entry.name, entry.aliases)} middleware ${entry.relation} ${entry.toMiddleware}`);
@@ -58973,6 +58973,11 @@ function unreadCount(storePath) {
 }
 
 // src/server.js
+var DEBUG = !!process.env.CROSSTALK_DEBUG;
+function debug(...args) {
+  if (DEBUG) process.stderr.write(`crosstalk: ${args.join(" ")}
+`);
+}
 var CONFIG_PATH = process.env.CROSSTALK_CONFIG || join7(homedir3(), ".crosstalk", "config.env");
 function loadConfig2(path) {
   const out = {};
@@ -59010,20 +59015,26 @@ if (ready) {
 `);
   }
 }
+var PEER_NAME_RE = /^[a-z][a-z0-9-]{1,31}$/;
+function validatePeerName(name) {
+  return typeof name === "string" && PEER_NAME_RE.test(name);
+}
 function buildBody({ from, to, subject, content }) {
+  if (!validatePeerName(from)) throw new Error(`invalid sender peer name: "${from}"`);
+  if (!validatePeerName(to)) throw new Error(`invalid recipient peer name: "${to}"`);
   const msg_id = randomBytes(8).toString("hex");
   const ts = (/* @__PURE__ */ new Date()).toISOString();
   const base = { from, to, subject: subject || "", content, msg_id, ts };
   if (identity) {
     try {
       const sig = signCanonical(identity.privateKey, { msg_id, from, to, subject: subject || "", content, ts });
-      return JSON.stringify({ ...base, sig, advertised_pubkey: identity.pubkeyB64, from_node: from });
+      return { body: JSON.stringify({ ...base, sig, advertised_pubkey: identity.pubkeyB64, from_node: from }), msg_id };
     } catch (e5) {
       process.stderr.write(`crosstalk: sign failed (${e5?.message || e5}); sending unsigned
 `);
     }
   }
-  return JSON.stringify(base);
+  return { body: JSON.stringify(base), msg_id };
 }
 async function creds() {
   return resolveCognitoCreds({
@@ -59034,6 +59045,7 @@ async function creds() {
     username: cognito.username,
     refreshToken: cognito.refreshToken,
     password: cognito.password
+    // TODO: after first successful creds() call, clear cognito.password from memory to reduce exposure window
   });
 }
 function notReadyResult() {
@@ -59046,6 +59058,15 @@ function notReadyResult() {
   };
 }
 var INBOX_STORE = process.env.CROSSTALK_INBOX_STORE || join7(homedir3(), ".crosstalk", "inbox.jsonl");
+var sentMessages = /* @__PURE__ */ new Map();
+var MAX_SENT_TRACKED = 500;
+function trackMessage(msg_id, data2) {
+  if (sentMessages.size >= MAX_SENT_TRACKED) {
+    const firstKey = sentMessages.keys().next().value;
+    if (firstKey) sentMessages.delete(firstKey);
+  }
+  sentMessages.set(msg_id, data2);
+}
 var server = new McpServer(
   { name: "crosstalk", version: "0.1.0" },
   { capabilities: { tools: {} } }
@@ -59056,16 +59077,54 @@ server.tool(
   { to: external_exports.string().describe("recipient peer name"), subject: external_exports.string().optional(), content: external_exports.string().describe("message body") },
   async ({ to, subject, content }) => {
     if (!ready) return notReadyResult();
-    const body = buildBody({ from: inbox.peer, to, subject: subject || "", content });
+    const { body, msg_id } = buildBody({ from: inbox.peer, to, subject: subject || "", content });
     try {
       const c5 = await creds();
-      const r5 = await sendMessage({ region: inbox.region, queueUrl: screenQueueUrl(inbox.region, inbox.account, to), body, creds: c5 });
-      return { content: [{ type: "text", text: `Sent to ${to} via the content screen (MessageId ${r5.MessageId || "?"}). It will be delivered if it passes screening.` }] };
+      const queueUrl = screenQueueUrl(inbox.region, inbox.account, to);
+      debug(`send_message: to=${to} queueUrl=${queueUrl}`);
+      const r5 = await sendMessage({ region: inbox.region, queueUrl, body, creds: c5 });
+      const sqsMsgId = r5.MessageId || "?";
+      debug(`send_message: sent msg_id=${msg_id} sqsMsgId=${sqsMsgId}`);
+      trackMessage(msg_id, { to, subject: subject || "", ts: (/* @__PURE__ */ new Date()).toISOString(), status: "sent", detail: "queued to content screen (verdict unknown \u2014 screen function processes asynchronously)" });
+      const lines = [
+        `Sent to ${to} via the content screen (MessageId ${sqsMsgId}).`,
+        `Message tracking id: ${msg_id}.`,
+        `You will NOT be notified if the screen rejects your message \u2014 use check_message_status to poll delivery outcome.`
+      ];
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     } catch (e5) {
       const msg = String(e5?.message || e5);
-      const hint = /AccessDenied|not authorized/i.test(msg) ? ` \u2014 you don't have a grant to message "${to}" (ask the admin to grant it).` : "";
+      debug(`send_message: failed msg_id=${msg_id} error=${msg.slice(0, 200)}`);
+      trackMessage(msg_id, { to, subject: subject || "", ts: (/* @__PURE__ */ new Date()).toISOString(), status: "failed", detail: msg.slice(0, 200) });
+      const hint = /AccessDenied|not authorized/i.test(msg) ? ` \u2014 you may not have a grant to message this peer, or the peer may not exist. Ask the admin to check.` : "";
       return { isError: true, content: [{ type: "text", text: `send failed: ${msg.split("\n").slice(-2).join(" ").slice(0, 300)}${hint}` }] };
     }
+  }
+);
+server.tool(
+  "check_message_status",
+  "Check the delivery/screening status of a previously sent message by its tracking id (returned by send_message). Lets you confirm whether the message was consumed by the screen or is still pending.",
+  { msg_id: external_exports.string().describe("message tracking id from send_message response") },
+  async ({ msg_id }) => {
+    if (!ready) return notReadyResult();
+    const record2 = sentMessages.get(msg_id);
+    if (!record2) {
+      return { content: [{ type: "text", text: `No record found for message id "${msg_id}". Tracking is in-memory only \u2014 ids from before this session are not available.` }] };
+    }
+    let statusLine = `Message ${msg_id} \u2192 ${record2.to}`;
+    if (record2.subject) statusLine += ` (${record2.subject})`;
+    statusLine += `
+Sent at: ${record2.ts}`;
+    statusLine += `
+Status: ${record2.status}`;
+    statusLine += `
+Detail: ${record2.detail}`;
+    if (record2.status === "sent") {
+      statusLine += `
+
+Note: The screen function processes messages asynchronously. This status only confirms the message was queued \u2014 it does not confirm delivery. Ask the recipient to check their inbox.`;
+    }
+    return { content: [{ type: "text", text: statusLine }] };
   }
 );
 server.tool(
@@ -59109,13 +59168,17 @@ server.tool(
   { to: external_exports.string(), content: external_exports.string(), subject: external_exports.string().optional() },
   async ({ to, content, subject }) => {
     if (!ready) return notReadyResult();
-    const body = buildBody({ from: inbox.peer, to, subject: subject || "re:", content });
+    const { body, msg_id } = buildBody({ from: inbox.peer, to, subject: subject || "re:", content });
     try {
       const c5 = await creds();
       const r5 = await sendMessage({ region: inbox.region, queueUrl: screenQueueUrl(inbox.region, inbox.account, to), body, creds: c5 });
-      return { content: [{ type: "text", text: `Reply sent to ${to} (MessageId ${r5.MessageId || "?"}).` }] };
+      const sqsMsgId = r5.MessageId || "?";
+      trackMessage(msg_id, { to, subject: subject || "re:", ts: (/* @__PURE__ */ new Date()).toISOString(), status: "sent", detail: "queued to content screen" });
+      return { content: [{ type: "text", text: `Reply sent to ${to} (MessageId ${sqsMsgId}). Message tracking id: ${msg_id}. Use check_message_status to check delivery outcome.` }] };
     } catch (e5) {
-      return { isError: true, content: [{ type: "text", text: `reply failed: ${String(e5?.message || e5).split("\n").slice(-2).join(" ").slice(0, 300)}` }] };
+      const msg = String(e5?.message || e5);
+      const hint = /AccessDenied|not authorized/i.test(msg) ? ` \u2014 you may not have a grant to message this peer, or the peer may not exist. Ask the admin to check.` : "";
+      return { isError: true, content: [{ type: "text", text: `reply failed: ${msg.split("\n").slice(-2).join(" ").slice(0, 300)}${hint}` }] };
     }
   }
 );
@@ -59137,7 +59200,9 @@ var transport = new StdioServerTransport();
 await server.connect(transport);
 async function pollOnce() {
   const c5 = await creds();
+  debug("pollOnce: polling inbox");
   const msgs = await receiveMessages({ region: inbox.region, queueUrl: cfg.CROSSTALK_SQS_INBOX_URL, max: 10, waitSeconds: 20, creds: c5 });
+  debug(`pollOnce: received ${msgs.length} message(s)`);
   for (const m3 of msgs) {
     let parsed;
     try {
@@ -59145,6 +59210,7 @@ async function pollOnce() {
     } catch {
       parsed = { content: m3.Body };
     }
+    debug(`pollOnce: storing msg_id=${parsed.msg_id || "?"}`);
     appendIfNew(INBOX_STORE, parsed);
     try {
       await deleteMessage({ region: inbox.region, queueUrl: cfg.CROSSTALK_SQS_INBOX_URL, receiptHandle: m3.ReceiptHandle, creds: c5 });
@@ -59154,14 +59220,18 @@ async function pollOnce() {
     }
   }
 }
+var pollBackoff = 1;
 async function pollLoop() {
   for (; ; ) {
     try {
       await pollOnce();
+      pollBackoff = 1;
     } catch (e5) {
-      process.stderr.write(`crosstalk: poll error (${e5?.message || e5})
+      const waitMs = Math.min(pollBackoff * 1e3, 6e4);
+      process.stderr.write(`crosstalk: poll error (${e5?.message || e5}); retrying in ${waitMs / 1e3}s
 `);
-      await new Promise((r5) => setTimeout(r5, 5e3));
+      await new Promise((r5) => setTimeout(r5, waitMs));
+      pollBackoff = Math.min(pollBackoff * 2, 60);
     }
   }
 }
@@ -59171,5 +59241,6 @@ if (ready) {
     process.stderr.write(`crosstalk: ${n3} unread message(s) in the local inbox \u2014 call check_inbox to read them.
 `);
   }
-  pollLoop();
+  pollLoop().catch((e5) => process.stderr.write(`crosstalk: poll loop crashed (${e5?.message || e5})
+`));
 }
