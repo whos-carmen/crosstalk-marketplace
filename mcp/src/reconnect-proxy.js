@@ -46,6 +46,7 @@ const MIN_SURVIVAL_MS = 5_000;
 let cachedInitializeRequest = null;  // raw JSON line of the initialize request
 let cachedInitializeResponse = null; // raw JSON line of the initialize response
 let pendingReplay = false;           // true while replaying handshake to new child
+let replayPendingId = null;          // fresh id of the replayed initialize, for response-based drain
 
 // ── JSON-RPC helpers ─────────────────────────────────────────────────────────
 
@@ -107,6 +108,7 @@ function startChild() {
   childExited = false;
   healthy = false;
   draining = false;
+  cachedInitializeResponse = null; // force fresh handshake replay on each new child
 
   child = spawn(process.execPath, [SERVER_PATH], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -136,6 +138,19 @@ function startChild() {
         if (resp.id === initReq.id && !resp.error) {
           cachedInitializeResponse = line;
           process.stderr.write("crosstalk-proxy: cached initialize response\n");
+        }
+      } catch { /* ignore parse errors */ }
+    }
+
+    // Detect response to a replayed initialize — trigger drain when received
+    if (replayPendingId && isJsonRpcResponse(line)) {
+      try {
+        const resp = JSON.parse(line);
+        if (resp.id === replayPendingId && !resp.error) {
+          replayPendingId = null;
+          pendingReplay = false;
+          process.stderr.write("crosstalk-proxy: handshake replay confirmed, draining buffer\n");
+          drainBuffer();
         }
       } catch { /* ignore parse errors */ }
     }
@@ -284,14 +299,18 @@ function replayOrDrain() {
     // Send the initialize request to the new child.
     // The response will be forwarded to host — a second initialize response
     // is harmless and keeps the MCP session state consistent for the host.
+    replayPendingId = freshId;
     child.stdin.write(replayLine + "\n");
 
-    // Give the child a moment to process initialize, then drain buffered requests
+    // Safety timeout: if the child never responds to the replay, drain anyway
     setTimeout(() => {
-      pendingReplay = false;
-      process.stderr.write("crosstalk-proxy: handshake replay sent, draining buffer\n");
-      drainBuffer();
-    }, 200);
+      if (replayPendingId) {
+        replayPendingId = null;
+        pendingReplay = false;
+        process.stderr.write("crosstalk-proxy: handshake replay timeout, draining buffer\n");
+        drainBuffer();
+      }
+    }, 5000);
   } catch (err) {
     pendingReplay = false;
     process.stderr.write(`crosstalk-proxy: handshake replay failed (${err.message}), draining anyway\n`);
@@ -332,7 +351,7 @@ stdinRl.on("line", (line) => {
     return;
   }
 
-  if (!healthy) {
+  if (!healthy || pendingReplay) {
     if (isJsonRpcRequest(line)) {
       requestBuffer.push(line);
     } else if (isNotification(line)) {
