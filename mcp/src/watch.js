@@ -161,12 +161,13 @@ function loadState() {
 
 async function saveState(state) {
   try {
-    // Prune unbounded state.seen growth
+    // Prune unbounded state.seen growth — keep the 200 most recent entries
     const keys = Object.keys(state.seen);
     if (keys.length > 1000) {
+      // state.seen values are timestamps (ms); sort oldest-first and drop the extras
+      const sorted = keys.sort((a, b) => (state.seen[a] || 0) - (state.seen[b] || 0));
       const pruned = {};
-      const recent = keys.slice(-200);
-      for (const k of recent) pruned[k] = state.seen[k];
+      for (const k of sorted.slice(-200)) pruned[k] = state.seen[k];
       state.seen = pruned;
     }
 
@@ -202,7 +203,7 @@ function buildEmailContent(newMessages, unreadCount) {
   }
 
   lines.push("");
-  lines.push("Run /crosstalk-check or ask your AI to call check_inbox to read and reply.");
+  lines.push("Ask your AI to call check_inbox to read and reply.");
   return lines.join("\n");
 }
 
@@ -301,7 +302,7 @@ async function _checkAndNotify() {
     if (msg._read) continue; // skip already-read
     if (!state.seen[msgId]) {
       newMessages.push(msg);
-      state.seen[msgId] = 1;
+      state.seen[msgId] = Date.now();
     }
   }
 
@@ -318,10 +319,12 @@ async function _checkAndNotify() {
 
   const sent = await sendEmail(config, newMessages, unreadCount);
 
-  // Only persist state if email was sent successfully
+  // Always persist seen state — prevents re-notification on next trigger
+  // even if email delivery fails. Only update lastRun on success to allow
+  // retry on the next file-change event.
+  await saveState(state);
   if (sent) {
     await writeFile(LAST_RUN_PATH, String(now), "utf8").catch(() => {});
-    await saveState(state);
   }
 }
 

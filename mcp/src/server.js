@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// crosstalk MCP for Reasonix — screened, SQS-backed messaging.
-// No auto-poller (inbox polling is handled externally via crosstalk-watcher or the Claude plugin).
+// crosstalk MCP — screened, SQS-backed messaging with built-in auto-poller.
+// The auto-poller (pollLoop) writes new SQS messages to ~/.crosstalk/inbox.jsonl.
+// External watchers (crosstalk-watch, Claude plugin) read from that store.
 //
 // Config: read from ~/.crosstalk/config.env (written by /crosstalk-join) — the CROSSTALK_SQS_COGNITO_*
 // bootstrap + CROSSTALK_SQS_INBOX_URL. Creds resolve via the vendored cognito-creds resolver
@@ -199,23 +200,39 @@ server.tool(
 
 server.tool(
   "check_inbox",
-  "Fetch and acknowledge new crosstalk messages from your own inbox. Reads from the local store (populated by the external auto-poller). Messages are marked as read automatically.",
+  "Fetch and acknowledge new crosstalk messages from your own inbox. Reads from the local store (populated by the built-in auto-poller). Messages are marked as read automatically.",
   { limit: z.number().int().min(1).max(10).optional() },
   async ({ limit }) => {
     if (!ready) return notReadyResult();
+    const max = limit || 10;
     try {
-      // First try the local store (populated by the auto-poller / crosstalk-watcher via MCP).
-      const stored = takeUnread(INBOX_STORE, limit || 10);
-      if (stored.length) {
+      // First try the local store (populated by the built-in auto-poller).
+      const stored = takeUnread(INBOX_STORE, max);
+      // If the store returned fewer results than requested, SQS may have newer
+      // messages that haven't been polled yet — fall through to a direct receive.
+      if (stored.length >= max) {
         const out = stored.map((p) => `from ${p.from || "?"}${p.subject ? ` [${p.subject}]` : ""}: ${p.content || ""}`);
         return { content: [{ type: "text", text: out.join("\n\n") }] };
       }
-      // Fall back to direct SQS receive when the store is empty (no auto-poller running).
+      // Fall back to direct SQS receive (store empty or partial).
       const c = await creds();
-      const msgs = await receiveMessages({ region: inbox.region, queueUrl: cfg.CROSSTALK_SQS_INBOX_URL, max: limit || 5, creds: c });
-      if (!msgs.length) return { content: [{ type: "text", text: "No new messages." }] };
+      const msgs = await receiveMessages({ region: inbox.region, queueUrl: cfg.CROSSTALK_SQS_INBOX_URL, max: Math.max(0, max - stored.length), creds: c });
+      if (!msgs.length) {
+        if (stored.length) {
+          const out = stored.map((p) => `from ${p.from || "?"}${p.subject ? ` [${p.subject}]` : ""}: ${p.content || ""}`);
+          return { content: [{ type: "text", text: out.join("\n\n") }] };
+        }
+        return { content: [{ type: "text", text: "No new messages." }] };
+      }
       const out = [];
-      for (const m of msgs) {
+      // Include partial local store results first (older), then SQS results (newer)
+      for (const p of stored) {
+        out.push(`from ${p.from || "?"}${p.subject ? ` [${p.subject}]` : ""}: ${p.content || ""}`);
+      }
+      // Cap SQS results to respect the user's limit
+      const sqsLimit = Math.max(0, max - stored.length);
+      const cappedMsgs = msgs.slice(0, sqsLimit);
+      for (const m of cappedMsgs) {
         let parsed; try { parsed = JSON.parse(m.Body); } catch { parsed = { content: m.Body }; }
         out.push(`from ${parsed.from || "?"}${parsed.subject ? ` [${parsed.subject}]` : ""}: ${parsed.content || ""}`);
         try { await deleteMessage({ region: inbox.region, queueUrl: cfg.CROSSTALK_SQS_INBOX_URL, receiptHandle: m.ReceiptHandle, creds: c }); } catch { /* best-effort ack */ }

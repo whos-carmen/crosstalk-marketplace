@@ -251,16 +251,51 @@ function startChild() {
     // 'exit' will fire after 'error', so respawn logic is there
   });
 
-  // Heuristic: if no data arrives within 100ms, assume child is ready
-  const readyTimer = setTimeout(() => {
-    if (childExited) return;
-    if (!healthy) {
-      healthy = true;
-      process.stderr.write("crosstalk-proxy: child assumed ready\n");
-      replayOrDrain();
+  // Safety: if child never produces stdout within HEALTHY_TIMEOUT_MS, it's
+  // stuck or misconfigured. Kill and respawn rather than buffer forever.
+  const HEALTHY_TIMEOUT_MS = 5_000;
+  const healthyTimer = setTimeout(() => {
+    if (healthy || childExited || shuttingDown) return;
+    process.stderr.write(
+      `crosstalk-proxy: child (pid ${child.pid}) produced no stdout in ${HEALTHY_TIMEOUT_MS / 1000}s — respawning\n`,
+    );
+    // Kill the hung child
+    try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    setTimeout(() => {
+      if (child && !childExited) {
+        try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      }
+    }, 1000).unref();
+    childExited = true;
+    healthy = false;
+    // Fail any buffered requests
+    for (const line of requestBuffer) {
+      if (isJsonRpcRequest(line)) {
+        const id = parseId(line);
+        if (id !== null) {
+          let method = "(unknown)";
+          try { method = JSON.parse(line).method; } catch { /* ignore */ }
+          process.stdout.write(buildErrorResponse(id, -32000, `Server error: child startup timed out. The request "${method}" was not completed.`));
+        }
+      }
     }
-  }, 100);
-  if (readyTimer.unref) readyTimer.unref();
+    requestBuffer.length = 0;
+    crashCount++;
+    if (crashCount >= MAX_CONSECUTIVE_CRASHES) {
+      process.stderr.write(
+        `crosstalk-proxy: ${MAX_CONSECUTIVE_CRASHES} consecutive crashes — giving up.\n`,
+      );
+      process.exit(1);
+    }
+    const waitMs = Math.min(backoffMs, MAX_BACKOFF_MS);
+    backoffMs = Math.min(backoffMs * BACKOFF_FACTOR, MAX_BACKOFF_MS);
+    setTimeout(() => {
+      if (shuttingDown) return;
+      if (!childExited) return;
+      startChild();
+    }, waitMs);
+  }, HEALTHY_TIMEOUT_MS);
+  if (healthyTimer.unref) healthyTimer.unref();
 }
 
 function drainBuffer() {
